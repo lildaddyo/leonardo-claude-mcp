@@ -1,7 +1,8 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import express from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -10,6 +11,7 @@ import { z } from "zod";
 
 const API_KEY = process.env.LEONARDO_API_KEY ?? "";
 const BASE_URL = "https://cloud.leonardo.ai/api/rest/v1";
+const LEO_TIMEOUT_MS = 30_000; // per Leonardo REST call, so a stuck upstream cannot pin connections
 
 if (!API_KEY) {
   console.error("LEONARDO_API_KEY env var is required");
@@ -29,6 +31,7 @@ async function leo<T>(
       "authorization": `Bearer ${API_KEY}`,
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(LEO_TIMEOUT_MS),
   });
 
   const text = await res.text();
@@ -43,7 +46,7 @@ async function pollGeneration(generationId: string): Promise<GenerationResult> {
   for (let i = 0; i < 30; i++) {
     await sleep(3000);
     const data = await leo<{ generations_by_pk: GenerationResult }>(
-      "GET", `/generations/${generationId}`
+      "GET", `/generations/${idSegment(generationId)}`
     );
     const gen = data.generations_by_pk;
     if (gen.status === "COMPLETE" || gen.status === "FAILED") return gen;
@@ -53,6 +56,27 @@ async function pollGeneration(generationId: string): Promise<GenerationResult> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Id validation
+// Ids that end up in a Leonardo REST path must be plain UUIDs, otherwise input
+// like "../models/<id>" would reach other authenticated endpoints with our key.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Model ids are UUIDs, but some platform aliases (e.g. "leonardo_phoenix") are plain words.
+const MODEL_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+function uuidArg(what: string) {
+  return z.string().trim().regex(UUID_RE, `${what} must be a UUID like 3fa85f64-5717-4562-b3fc-2c963f66afa6`);
+}
+
+/** Validates a UUID and encodes it for use as a single URL path segment. */
+function idSegment(id: string): string {
+  const v = String(id).trim();
+  if (!UUID_RE.test(v)) throw new Error("Invalid id: expected a UUID");
+  return encodeURIComponent(v);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -194,495 +218,580 @@ interface InitImageResponse {
 // MCP Server
 // ─────────────────────────────────────────────────────────────────────────────
 
-const server = new McpServer({
-  name: "leonardo-mcp-server",
-  version: "1.0.0",
-});
+/** Builds a fresh McpServer with all tools registered. HTTP mode creates one per request
+ * (the SDK's stateless pattern), so concurrent requests never share a transport. */
+function createServer(): McpServer {
+  const server = new McpServer({
+    name: "leonardo-mcp-server",
+    version: "1.0.0",
+  });
 
-// ─── 1. Get User Info & Credit Balance ───────────────────────────────────────
+  // ─── 1. Get User Info & Credit Balance ───────────────────────────────────────
 
-server.registerTool(
-  "leonardo_get_user_info",
-  {
-    title: "Get User Info",
-    description: `Returns your Leonardo AI account information including username, user ID, and API credit balance.
-Use this first to confirm authentication is working and to check remaining credits before heavy generation runs.
+  server.registerTool(
+    "leonardo_get_user_info",
+    {
+      title: "Get User Info",
+      description: `Returns your Leonardo AI account information including username, user ID, and API credit balance.
+  Use this first to confirm authentication is working and to check remaining credits before heavy generation runs.
 
-Returns:
-  { id, username, email?, apiCreditBalance, tokenRenewalDate }`,
-    inputSchema: z.object({}),
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  },
-  async () => {
-    try {
-      const data = await leo<{ user_details: Array<{ user: UserInfo; apiCreditBalance: number }> }>(
-        "GET", "/me"
-      );
-      const detail = data.user_details?.[0];
-      const user = detail?.user;
-      const result = {
-        id: user?.id,
-        username: user?.username,
-        tokenRenewalDate: user?.tokenRenewalDate,
-        apiCreditBalance: detail?.apiCreditBalance,
-      };
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-    } catch (err) {
-      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
-    }
-  }
-);
-
-// ─── 2. List Platform Models ──────────────────────────────────────────────────
-
-server.registerTool(
-  "leonardo_list_models",
-  {
-    title: "List Platform Models",
-    description: `Lists all available Leonardo AI platform models with their IDs, names, and descriptions.
-Use this to discover model IDs before calling leonardo_generate_image.
-
-Key models (as of early 2026):
-- Phoenix: leonardo_phoenix (flagship, best quality, great text rendering)
-- Lightning XL: aa77f04e-3eec-4034-9c07-d0f619684628 (fast)
-- Vision XL: 5c232a9e-9061-4777-980a-ddc8e65647c6 (photorealistic)
-- Anime XL: e71a1c2f-4f80-4800-934f-2c68979d1cc1
-
-Returns: Array of { id, name, description, featured, nsfw }`,
-    inputSchema: z.object({
-      limit: z.number().int().min(1).max(100).default(20).describe("Max models to return"),
-    }),
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  },
-  async ({ limit }) => {
-    try {
-      const data = await leo<{ custom_models: PlatformModel[] }>(
-        "GET", `/platformModels?limit=${limit}`
-      );
-      const models = (data.custom_models ?? []).map(m => ({
-        id: m.id,
-        name: m.name,
-        description: m.description,
-        featured: m.featured,
-        nsfw: m.nsfw,
-      }));
-      return { content: [{ type: "text" as const, text: JSON.stringify(models, null, 2) }] };
-    } catch (err) {
-      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
-    }
-  }
-);
-
-// ─── 3. Generate Image (Text-to-Image) ───────────────────────────────────────
-
-server.registerTool(
-  "leonardo_generate_image",
-  {
-    title: "Generate Image (Text-to-Image)",
-    description: `Generate images from a text prompt using Leonardo AI.
-Automatically polls until complete and returns image URLs.
-
-Args:
-  - prompt (string): Describe the image. Be specific about style, lighting, composition.
-  - model_id (string, optional): Leonardo model ID. Defaults to "b24e16ff-06e3-43eb-8d33-4416c2d75876" (Phoenix).
-    Use leonardo_list_models to discover model IDs.
-  - num_images (int 1-4): Number of images to generate. Default 1.
-  - width (int): Image width in pixels. Default 1024. Use multiples of 8.
-  - height (int): Image height in pixels. Default 1024. Use multiples of 8.
-  - negative_prompt (string, optional): What to avoid in the generation.
-  - alchemy (bool): Enable Alchemy pipeline for higher fidelity. Default true.
-  - ultra (bool): Enable Ultra mode (even higher quality, costs more). Default false.
-  - contrast (float 1-4.5): Contrast setting for Alchemy. Default 3.5.
-  - style_uuid (string, optional): Style UUID to apply. E.g. "111dc692-d470-4eec-b791-3475abac4c46" (Dynamic).
-  - wait_for_result (bool): If true, polls and returns final URLs. If false, returns just the generationId. Default true.
-
-Returns (wait_for_result=true):
-  {
-    "generationId": string,
-    "status": "COMPLETE" | "FAILED",
-    "images": [{ "id": string, "url": string }],
-    "prompt": string
-  }
-
-Returns (wait_for_result=false):
-  { "generationId": string, "message": "Use leonardo_get_generation to poll" }
-
-Style UUIDs (common):
-  - Dynamic: 111dc692-d470-4eec-b791-3475abac4c46
-  - Cinematic: a84d5b80-5de7-4a9c-9b3b-c3c3f3f3f3f3
-  - Illustration: 645e4195-f63d-4715-a3f2-3fb1e6eb8c70
-  - Photography: 4a49d95e-61d3-4d2c-9f7a-6ad0c07b3e5a`,
-    inputSchema: z.object({
-      prompt: z.string().min(1).max(1500).describe("Text prompt describing the image"),
-      model_id: z.string().optional().describe("Leonardo model ID (default: Phoenix)"),
-      num_images: z.number().int().min(1).max(4).default(1).describe("Number of images (1-4)"),
-      width: z.number().int().min(256).max(1536).default(1024).describe("Width in pixels (multiples of 8)"),
-      height: z.number().int().min(256).max(1536).default(1024).describe("Height in pixels (multiples of 8)"),
-      negative_prompt: z.string().optional().describe("What to avoid"),
-      alchemy: z.boolean().default(true).describe("Enable Alchemy pipeline"),
-      ultra: z.boolean().default(false).describe("Enable Ultra mode"),
-      contrast: z.number().min(1).max(4.5).default(3.5).describe("Contrast for Alchemy (1-4.5)"),
-      style_uuid: z.string().optional().describe("Style UUID to apply"),
-      wait_for_result: z.boolean().default(true).describe("Poll until complete and return image URLs"),
-    }),
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  },
-  async (params) => {
-    try {
-      const body: Record<string, unknown> = {
-        prompt: params.prompt,
-        num_images: params.num_images,
-        width: params.width,
-        height: params.height,
-        alchemy: params.alchemy,
-        ultra: params.ultra,
-        contrast: params.contrast,
-        public: false,
-      };
-      if (params.model_id) body.modelId = params.model_id;
-      if (params.negative_prompt) body.negative_prompt = params.negative_prompt;
-      if (params.style_uuid) body.styleUUID = params.style_uuid;
-
-      await reserveSpend(params.ultra ? "ultra" : "image");
-      const res = await leo<{ sdGenerationJob: { generationId: string } }>(
-        "POST", "/generations", body
-      );
-      const { generationId } = res.sdGenerationJob;
-
-      if (!params.wait_for_result) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({ generationId, message: "Use leonardo_get_generation to poll for results" }),
-          }],
-        };
-      }
-
-      const gen = await pollGeneration(generationId);
-      const result = {
-        generationId,
-        status: gen.status,
-        prompt: gen.prompt,
-        images: gen.generated_images.map(img => ({ id: img.id, url: img.url, nsfw: img.nsfw })),
-      };
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-    } catch (err) {
-      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
-    }
-  }
-);
-
-// ─── 4. Get Generation (Poll / Check Status) ─────────────────────────────────
-
-server.registerTool(
-  "leonardo_get_generation",
-  {
-    title: "Get Generation Status",
-    description: `Fetch the status and results of a generation by its ID.
-Use this to poll a generation started with wait_for_result=false, or to retrieve an older generation.
-
-Args:
-  - generation_id (string): The generationId returned by leonardo_generate_image or leonardo_image_to_image.
-
-Returns:
-  {
-    "id": string,
-    "status": "PENDING" | "COMPLETE" | "FAILED",
-    "prompt": string,
-    "images": [{ "id": string, "url": string, "nsfw": boolean }],
-    "width": number,
-    "height": number,
-    "createdAt": string
-  }`,
-    inputSchema: z.object({
-      generation_id: z.string().describe("The generationId to look up"),
-    }),
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  },
-  async ({ generation_id }) => {
-    try {
-      const data = await leo<{ generations_by_pk: GenerationResult }>(
-        "GET", `/generations/${generation_id}`
-      );
-      const gen = data.generations_by_pk;
-      const result = {
-        id: gen.id,
-        status: gen.status,
-        prompt: gen.prompt,
-        width: gen.width,
-        height: gen.height,
-        images: gen.generated_images.map(img => ({ id: img.id, url: img.url, nsfw: img.nsfw })),
-        createdAt: gen.createdAt,
-      };
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-    } catch (err) {
-      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
-    }
-  }
-);
-
-// ─── 5. Image-to-Image ────────────────────────────────────────────────────────
-
-server.registerTool(
-  "leonardo_image_to_image",
-  {
-    title: "Image-to-Image Generation",
-    description: `Generate a new image guided by an existing image (init image) plus a text prompt.
-The init image influences the composition, structure, and style. Strength controls how much influence it has.
-
-Args:
-  - prompt (string): Text prompt describing what to generate.
-  - init_image_id (string): The image ID returned by leonardo_upload_init_image.
-  - init_strength (float 0.0-1.0): How much the init image influences output. 0=ignore, 1=copy. Default 0.5.
-  - model_id (string, optional): Leonardo model ID. Defaults to Phoenix.
-  - num_images (int 1-4): Number of images. Default 1.
-  - width (int): Output width. Default 1024.
-  - height (int): Output height. Default 1024.
-  - negative_prompt (string, optional): What to avoid.
-  - wait_for_result (bool): Poll until complete. Default true.
-
-Returns same format as leonardo_generate_image.`,
-    inputSchema: z.object({
-      prompt: z.string().min(1).max(1500).describe("Text prompt"),
-      init_image_id: z.string().describe("Image ID from leonardo_upload_init_image"),
-      init_strength: z.number().min(0).max(1).default(0.5).describe("Init image influence (0-1)"),
-      model_id: z.string().optional().describe("Model ID (default: Phoenix)"),
-      num_images: z.number().int().min(1).max(4).default(1),
-      width: z.number().int().min(256).max(1536).default(1024),
-      height: z.number().int().min(256).max(1536).default(1024),
-      negative_prompt: z.string().optional(),
-      wait_for_result: z.boolean().default(true),
-    }),
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  },
-  async (params) => {
-    try {
-      const body: Record<string, unknown> = {
-        prompt: params.prompt,
-        init_image_id: params.init_image_id,
-        init_strength: params.init_strength,
-        isInitImage: true,
-        num_images: params.num_images,
-        width: params.width,
-        height: params.height,
-        public: false,
-      };
-      if (params.model_id) body.modelId = params.model_id;
-      if (params.negative_prompt) body.negative_prompt = params.negative_prompt;
-
-      await reserveSpend("image");
-      const res = await leo<{ sdGenerationJob: { generationId: string } }>(
-        "POST", "/generations", body
-      );
-      const { generationId } = res.sdGenerationJob;
-
-      if (!params.wait_for_result) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({ generationId, message: "Use leonardo_get_generation to poll for results" }),
-          }],
-        };
-      }
-
-      const gen = await pollGeneration(generationId);
-      const result = {
-        generationId,
-        status: gen.status,
-        prompt: gen.prompt,
-        images: gen.generated_images.map(img => ({ id: img.id, url: img.url, nsfw: img.nsfw })),
-      };
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-    } catch (err) {
-      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
-    }
-  }
-);
-
-// ─── 6. Upload Init Image (URL → Leonardo) ────────────────────────────────────
-
-server.registerTool(
-  "leonardo_upload_init_image_from_url",
-  {
-    title: "Upload Init Image from URL",
-    description: `Upload an image from a public URL to Leonardo AI so it can be used as an init image for img2img.
-Returns an image ID that you pass to init_image_id in leonardo_image_to_image.
-
-This is a two-step process:
-1. This tool creates an upload slot and returns presigned S3 upload details.
-2. The actual S3 upload must be done by the caller (not supported in this tool — use the Lovable / server-side approach).
-
-For simpler use cases, use imagePrompts parameter instead (pass URL directly).
-
-Args:
-  - extension (string): File extension — "png", "jpg", "jpeg", or "webp"
-
-Returns:
-  { id: string, url: string, fields: object }
-  The fields + url are used to POST the image to S3.`,
-    inputSchema: z.object({
-      extension: z.enum(["png", "jpg", "jpeg", "webp"]).describe("File extension of the image"),
-    }),
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  },
-  async ({ extension }) => {
-    try {
-      const data = await leo<InitImageResponse>(
-        "POST", "/init-image", { extension }
-      );
-      const { id, url, fields } = data.uploadInitImage;
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({
-            id,
-            upload_url: url,
-            fields: JSON.parse(fields),
-            instruction: `POST the image file as multipart/form-data to upload_url, including all fields. Then use id="${id}" as init_image_id in leonardo_image_to_image.`,
-          }, null, 2),
-        }],
-      };
-    } catch (err) {
-      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
-    }
-  }
-);
-
-// ─── 7. Image-to-Video (Motion) ───────────────────────────────────────────────
-
-server.registerTool(
-  "leonardo_image_to_video",
-  {
-    title: "Image-to-Video (Motion)",
-    description: `Animate a still image into a short video clip using Leonardo Motion (SVD-based).
-Requires an image ID from a previous Leonardo generation (not an uploaded init image).
-
-Args:
-  - image_id (string): The image ID (from generated_images[].id in a generation result).
-  - motion_strength (int 1-10): How much motion to apply. 1=subtle, 10=chaotic. Default 5.
-  - wait_for_result (bool): Poll until complete and return video URL. Default true.
-
-Returns:
-  { generationId, status, motionMP4URL }
-
-Note: Motion generations take 30-60 seconds and consume more API credits than images.`,
-    inputSchema: z.object({
-      image_id: z.string().describe("Image ID from a Leonardo generation"),
-      motion_strength: z.number().int().min(1).max(10).default(5).describe("Motion strength (1-10)"),
-      wait_for_result: z.boolean().default(true).describe("Poll until video URL is ready"),
-    }),
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  },
-  async (params) => {
-    try {
-      await reserveSpend("video");
-      const res = await leo<{ motionSvdGenerationJob: { generationId: string } }>(
-        "POST", "/generations/image-to-motion",
-        {
-          imageId: params.image_id,
-          motionStrength: params.motion_strength,
-          isPublic: false,
-        }
-      );
-      const { generationId } = res.motionSvdGenerationJob;
-
-      if (!params.wait_for_result) {
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify({ generationId, message: "Use leonardo_get_generation to poll" }) }],
-        };
-      }
-
-      const gen = await pollGeneration(generationId);
-      const videoURL = gen.generated_images?.[0]?.motionMP4URL ?? null;
-      const result = {
-        generationId,
-        status: gen.status,
-        motionMP4URL: videoURL,
-        imageURL: gen.generated_images?.[0]?.url ?? null,
-      };
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-    } catch (err) {
-      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
-    }
-  }
-);
-
-// ─── 8. Upscale Image ─────────────────────────────────────────────────────────
-
-server.registerTool(
-  "leonardo_upscale_image",
-  {
-    title: "Upscale Image",
-    description: `Upscale a generated image to a higher resolution using Leonardo's upscaling pipeline.
-Requires an image ID from a previous Leonardo generation.
-
-Args:
-  - image_id (string): The image ID from a Leonardo generation (generated_images[].id).
-
-Returns:
-  { id, url } — the upscaled image.
-
-Note: Upscaling takes 10-30 seconds. The result is returned directly (no polling needed).`,
-    inputSchema: z.object({
-      image_id: z.string().describe("Image ID from a Leonardo generation to upscale"),
-    }),
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  },
-  async ({ image_id }) => {
-    try {
-      await reserveSpend("upscale");
-      const res = await leo<{ createdVariation: { id: string } }>(
-        "POST", `/variations/upscale`, { id: image_id }
-      );
-      // Poll for upscale completion
-      const varId = res.createdVariation.id;
-      for (let i = 0; i < 20; i++) {
-        await sleep(3000);
-        const data = await leo<{ generated_image_variation_generic: Array<{ id: string; url: string; status: string }> }>(
-          "GET", `/variations/${varId}`
+  Returns:
+    { id, username, email?, apiCreditBalance, tokenRenewalDate }`,
+      inputSchema: z.object({}),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async () => {
+      try {
+        const data = await leo<{ user_details: Array<{ user: UserInfo; apiCreditBalance: number }> }>(
+          "GET", "/me"
         );
-        const variation = data.generated_image_variation_generic?.[0];
-        if (variation?.status === "COMPLETE") {
-          return { content: [{ type: "text" as const, text: JSON.stringify({ id: variation.id, url: variation.url }) }] };
-        }
-        if (variation?.status === "FAILED") {
-          return { content: [{ type: "text" as const, text: "Upscale FAILED" }] };
-        }
+        const detail = data.user_details?.[0];
+        const user = detail?.user;
+        const result = {
+          id: user?.id,
+          username: user?.username,
+          tokenRenewalDate: user?.tokenRenewalDate,
+          apiCreditBalance: detail?.apiCreditBalance,
+        };
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
       }
-      return { content: [{ type: "text" as const, text: `Upscale timed out. Variation ID: ${varId}` }] };
-    } catch (err) {
-      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
     }
-  }
-);
+  );
 
-// ─── 9. Delete Generation ────────────────────────────────────────────────────
+  // ─── 2. List Platform Models ──────────────────────────────────────────────────
 
-server.registerTool(
-  "leonardo_delete_generation",
-  {
-    title: "Delete Generation",
-    description: `Delete a generation and all its images from your Leonardo account.
-Use this for cleanup after testing or when you no longer need results.
+  server.registerTool(
+    "leonardo_list_models",
+    {
+      title: "List Platform Models",
+      description: `Lists all available Leonardo AI platform models with their IDs, names, and descriptions.
+  Use this to discover model IDs before calling leonardo_generate_image.
 
-Args:
-  - generation_id (string): The generationId to delete.
+  Key models (as of early 2026):
+  - Phoenix: leonardo_phoenix (flagship, best quality, great text rendering)
+  - Lightning XL: aa77f04e-3eec-4034-9c07-d0f619684628 (fast)
+  - Vision XL: 5c232a9e-9061-4777-980a-ddc8e65647c6 (photorealistic)
+  - Anime XL: e71a1c2f-4f80-4800-934f-2c68979d1cc1
 
-Returns: { deleted: true } on success.`,
-    inputSchema: z.object({
-      generation_id: z.string().describe("The generationId to delete"),
-    }),
-    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
-  },
-  async ({ generation_id }) => {
-    try {
-      await leo("DELETE", `/generations/${generation_id}`);
-      return { content: [{ type: "text" as const, text: JSON.stringify({ deleted: true, id: generation_id }) }] };
-    } catch (err) {
-      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
+  Returns: Array of { id, name, description, featured, nsfw }`,
+      inputSchema: z.object({
+        limit: z.number().int().min(1).max(100).default(20).describe("Max models to return"),
+      }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ limit }) => {
+      try {
+        const data = await leo<{ custom_models: PlatformModel[] }>(
+          "GET", `/platformModels?limit=${limit}`
+        );
+        const models = (data.custom_models ?? []).map(m => ({
+          id: m.id,
+          name: m.name,
+          description: m.description,
+          featured: m.featured,
+          nsfw: m.nsfw,
+        }));
+        return { content: [{ type: "text" as const, text: JSON.stringify(models, null, 2) }] };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
+      }
     }
+  );
+
+  // ─── 3. Generate Image (Text-to-Image) ───────────────────────────────────────
+
+  server.registerTool(
+    "leonardo_generate_image",
+    {
+      title: "Generate Image (Text-to-Image)",
+      description: `Generate images from a text prompt using Leonardo AI.
+  Automatically polls until complete and returns image URLs.
+
+  Args:
+    - prompt (string): Describe the image. Be specific about style, lighting, composition.
+    - model_id (string, optional): Leonardo model ID. Defaults to "b24e16ff-06e3-43eb-8d33-4416c2d75876" (Phoenix).
+      Use leonardo_list_models to discover model IDs.
+    - num_images (int 1-4): Number of images to generate. Default 1.
+    - width (int): Image width in pixels. Default 1024. Use multiples of 8.
+    - height (int): Image height in pixels. Default 1024. Use multiples of 8.
+    - negative_prompt (string, optional): What to avoid in the generation.
+    - alchemy (bool): Enable Alchemy pipeline for higher fidelity. Default true.
+    - ultra (bool): Enable Ultra mode (even higher quality, costs more). Default false.
+    - contrast (float 1-4.5): Contrast setting for Alchemy. Default 3.5.
+    - style_uuid (string, optional): Style UUID to apply. E.g. "111dc692-d470-4eec-b791-3475abac4c46" (Dynamic).
+    - wait_for_result (bool): If true, polls and returns final URLs. If false, returns just the generationId. Default true.
+
+  Returns (wait_for_result=true):
+    {
+      "generationId": string,
+      "status": "COMPLETE" | "FAILED",
+      "images": [{ "id": string, "url": string }],
+      "prompt": string
+    }
+
+  Returns (wait_for_result=false):
+    { "generationId": string, "message": "Use leonardo_get_generation to poll" }
+
+  Style UUIDs (common):
+    - Dynamic: 111dc692-d470-4eec-b791-3475abac4c46
+    - Cinematic: a84d5b80-5de7-4a9c-9b3b-c3c3f3f3f3f3
+    - Illustration: 645e4195-f63d-4715-a3f2-3fb1e6eb8c70
+    - Photography: 4a49d95e-61d3-4d2c-9f7a-6ad0c07b3e5a`,
+      inputSchema: z.object({
+        prompt: z.string().min(1).max(1500).describe("Text prompt describing the image"),
+        model_id: z.string().trim().regex(MODEL_ID_RE, "model_id must be a Leonardo model id").optional().describe("Leonardo model ID (default: Phoenix)"),
+        num_images: z.number().int().min(1).max(4).default(1).describe("Number of images (1-4)"),
+        width: z.number().int().min(256).max(1536).default(1024).describe("Width in pixels (multiples of 8)"),
+        height: z.number().int().min(256).max(1536).default(1024).describe("Height in pixels (multiples of 8)"),
+        negative_prompt: z.string().max(1500).optional().describe("What to avoid"),
+        alchemy: z.boolean().default(true).describe("Enable Alchemy pipeline"),
+        ultra: z.boolean().default(false).describe("Enable Ultra mode"),
+        contrast: z.number().min(1).max(4.5).default(3.5).describe("Contrast for Alchemy (1-4.5)"),
+        style_uuid: uuidArg("style_uuid").optional().describe("Style UUID to apply"),
+        wait_for_result: z.boolean().default(true).describe("Poll until complete and return image URLs"),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async (params) => {
+      try {
+        const body: Record<string, unknown> = {
+          prompt: params.prompt,
+          num_images: params.num_images,
+          width: params.width,
+          height: params.height,
+          alchemy: params.alchemy,
+          ultra: params.ultra,
+          contrast: params.contrast,
+          public: false,
+        };
+        if (params.model_id) body.modelId = params.model_id;
+        if (params.negative_prompt) body.negative_prompt = params.negative_prompt;
+        if (params.style_uuid) body.styleUUID = params.style_uuid;
+
+        await reserveSpend(params.ultra ? "ultra" : "image");
+        const res = await leo<{ sdGenerationJob: { generationId: string } }>(
+          "POST", "/generations", body
+        );
+        const { generationId } = res.sdGenerationJob;
+
+        if (!params.wait_for_result) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ generationId, message: "Use leonardo_get_generation to poll for results" }),
+            }],
+          };
+        }
+
+        const gen = await pollGeneration(generationId);
+        const result = {
+          generationId,
+          status: gen.status,
+          prompt: gen.prompt,
+          images: gen.generated_images.map(img => ({ id: img.id, url: img.url, nsfw: img.nsfw })),
+        };
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
+      }
+    }
+  );
+
+  // ─── 4. Get Generation (Poll / Check Status) ─────────────────────────────────
+
+  server.registerTool(
+    "leonardo_get_generation",
+    {
+      title: "Get Generation Status",
+      description: `Fetch the status and results of a generation by its ID.
+  Use this to poll a generation started with wait_for_result=false, or to retrieve an older generation.
+
+  Args:
+    - generation_id (string): The generationId returned by leonardo_generate_image or leonardo_image_to_image.
+
+  Returns:
+    {
+      "id": string,
+      "status": "PENDING" | "COMPLETE" | "FAILED",
+      "prompt": string,
+      "images": [{ "id": string, "url": string, "nsfw": boolean }],
+      "width": number,
+      "height": number,
+      "createdAt": string
+    }`,
+      inputSchema: z.object({
+        generation_id: uuidArg("generation_id").describe("The generationId to look up"),
+      }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ generation_id }) => {
+      try {
+        const data = await leo<{ generations_by_pk: GenerationResult }>(
+          "GET", `/generations/${idSegment(generation_id)}`
+        );
+        const gen = data.generations_by_pk;
+        const result = {
+          id: gen.id,
+          status: gen.status,
+          prompt: gen.prompt,
+          width: gen.width,
+          height: gen.height,
+          images: gen.generated_images.map(img => ({ id: img.id, url: img.url, nsfw: img.nsfw })),
+          createdAt: gen.createdAt,
+        };
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
+      }
+    }
+  );
+
+  // ─── 5. Image-to-Image ────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "leonardo_image_to_image",
+    {
+      title: "Image-to-Image Generation",
+      description: `Generate a new image guided by an existing image (init image) plus a text prompt.
+  The init image influences the composition, structure, and style. Strength controls how much influence it has.
+
+  Args:
+    - prompt (string): Text prompt describing what to generate.
+    - init_image_id (string): The image ID returned by leonardo_upload_init_image.
+    - init_strength (float 0.0-1.0): How much the init image influences output. 0=ignore, 1=copy. Default 0.5.
+    - model_id (string, optional): Leonardo model ID. Defaults to Phoenix.
+    - num_images (int 1-4): Number of images. Default 1.
+    - width (int): Output width. Default 1024.
+    - height (int): Output height. Default 1024.
+    - negative_prompt (string, optional): What to avoid.
+    - wait_for_result (bool): Poll until complete. Default true.
+
+  Returns same format as leonardo_generate_image.`,
+      inputSchema: z.object({
+        prompt: z.string().min(1).max(1500).describe("Text prompt"),
+        init_image_id: uuidArg("init_image_id").describe("Image ID from leonardo_upload_init_image"),
+        init_strength: z.number().min(0).max(1).default(0.5).describe("Init image influence (0-1)"),
+        model_id: z.string().trim().regex(MODEL_ID_RE, "model_id must be a Leonardo model id").optional().describe("Model ID (default: Phoenix)"),
+        num_images: z.number().int().min(1).max(4).default(1),
+        width: z.number().int().min(256).max(1536).default(1024),
+        height: z.number().int().min(256).max(1536).default(1024),
+        negative_prompt: z.string().max(1500).optional(),
+        wait_for_result: z.boolean().default(true),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async (params) => {
+      try {
+        const body: Record<string, unknown> = {
+          prompt: params.prompt,
+          init_image_id: params.init_image_id,
+          init_strength: params.init_strength,
+          isInitImage: true,
+          num_images: params.num_images,
+          width: params.width,
+          height: params.height,
+          public: false,
+        };
+        if (params.model_id) body.modelId = params.model_id;
+        if (params.negative_prompt) body.negative_prompt = params.negative_prompt;
+
+        await reserveSpend("image");
+        const res = await leo<{ sdGenerationJob: { generationId: string } }>(
+          "POST", "/generations", body
+        );
+        const { generationId } = res.sdGenerationJob;
+
+        if (!params.wait_for_result) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ generationId, message: "Use leonardo_get_generation to poll for results" }),
+            }],
+          };
+        }
+
+        const gen = await pollGeneration(generationId);
+        const result = {
+          generationId,
+          status: gen.status,
+          prompt: gen.prompt,
+          images: gen.generated_images.map(img => ({ id: img.id, url: img.url, nsfw: img.nsfw })),
+        };
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
+      }
+    }
+  );
+
+  // ─── 6. Upload Init Image (URL → Leonardo) ────────────────────────────────────
+
+  server.registerTool(
+    "leonardo_upload_init_image_from_url",
+    {
+      title: "Upload Init Image from URL",
+      description: `Upload an image from a public URL to Leonardo AI so it can be used as an init image for img2img.
+  Returns an image ID that you pass to init_image_id in leonardo_image_to_image.
+
+  This is a two-step process:
+  1. This tool creates an upload slot and returns presigned S3 upload details.
+  2. The actual S3 upload must be done by the caller (not supported in this tool — use the Lovable / server-side approach).
+
+  For simpler use cases, use imagePrompts parameter instead (pass URL directly).
+
+  Args:
+    - extension (string): File extension — "png", "jpg", "jpeg", or "webp"
+
+  Returns:
+    { id: string, url: string, fields: object }
+    The fields + url are used to POST the image to S3.`,
+      inputSchema: z.object({
+        extension: z.enum(["png", "jpg", "jpeg", "webp"]).describe("File extension of the image"),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ extension }) => {
+      try {
+        const data = await leo<InitImageResponse>(
+          "POST", "/init-image", { extension }
+        );
+        const { id, url, fields } = data.uploadInitImage;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              id,
+              upload_url: url,
+              fields: JSON.parse(fields),
+              instruction: `POST the image file as multipart/form-data to upload_url, including all fields. Then use id="${id}" as init_image_id in leonardo_image_to_image.`,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
+      }
+    }
+  );
+
+  // ─── 7. Image-to-Video (Motion) ───────────────────────────────────────────────
+
+  server.registerTool(
+    "leonardo_image_to_video",
+    {
+      title: "Image-to-Video (Motion)",
+      description: `Animate a still image into a short video clip using Leonardo Motion (SVD-based).
+  Requires an image ID from a previous Leonardo generation (not an uploaded init image).
+
+  Args:
+    - image_id (string): The image ID (from generated_images[].id in a generation result).
+    - motion_strength (int 1-10): How much motion to apply. 1=subtle, 10=chaotic. Default 5.
+    - wait_for_result (bool): Poll until complete and return video URL. Default true.
+
+  Returns:
+    { generationId, status, motionMP4URL }
+
+  Note: Motion generations take 30-60 seconds and consume more API credits than images.`,
+      inputSchema: z.object({
+        image_id: uuidArg("image_id").describe("Image ID from a Leonardo generation"),
+        motion_strength: z.number().int().min(1).max(10).default(5).describe("Motion strength (1-10)"),
+        wait_for_result: z.boolean().default(true).describe("Poll until video URL is ready"),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async (params) => {
+      try {
+        await reserveSpend("video");
+        const res = await leo<{ motionSvdGenerationJob: { generationId: string } }>(
+          "POST", "/generations/image-to-motion",
+          {
+            imageId: params.image_id,
+            motionStrength: params.motion_strength,
+            isPublic: false,
+          }
+        );
+        const { generationId } = res.motionSvdGenerationJob;
+
+        if (!params.wait_for_result) {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ generationId, message: "Use leonardo_get_generation to poll" }) }],
+          };
+        }
+
+        const gen = await pollGeneration(generationId);
+        const videoURL = gen.generated_images?.[0]?.motionMP4URL ?? null;
+        const result = {
+          generationId,
+          status: gen.status,
+          motionMP4URL: videoURL,
+          imageURL: gen.generated_images?.[0]?.url ?? null,
+        };
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
+      }
+    }
+  );
+
+  // ─── 8. Upscale Image ─────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "leonardo_upscale_image",
+    {
+      title: "Upscale Image",
+      description: `Upscale a generated image to a higher resolution using Leonardo's upscaling pipeline.
+  Requires an image ID from a previous Leonardo generation.
+
+  Args:
+    - image_id (string): The image ID from a Leonardo generation (generated_images[].id).
+
+  Returns:
+    { id, url } — the upscaled image.
+
+  Note: Upscaling takes 10-30 seconds. The result is returned directly (no polling needed).`,
+      inputSchema: z.object({
+        image_id: uuidArg("image_id").describe("Image ID from a Leonardo generation to upscale"),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ image_id }) => {
+      try {
+        await reserveSpend("upscale");
+        const res = await leo<{ createdVariation: { id: string } }>(
+          "POST", `/variations/upscale`, { id: image_id }
+        );
+        // Poll for upscale completion
+        const varId = res.createdVariation.id;
+        for (let i = 0; i < 20; i++) {
+          await sleep(3000);
+          const data = await leo<{ generated_image_variation_generic: Array<{ id: string; url: string; status: string }> }>(
+            "GET", `/variations/${idSegment(varId)}`
+          );
+          const variation = data.generated_image_variation_generic?.[0];
+          if (variation?.status === "COMPLETE") {
+            return { content: [{ type: "text" as const, text: JSON.stringify({ id: variation.id, url: variation.url }) }] };
+          }
+          if (variation?.status === "FAILED") {
+            return { content: [{ type: "text" as const, text: "Upscale FAILED" }] };
+          }
+        }
+        return { content: [{ type: "text" as const, text: `Upscale timed out. Variation ID: ${varId}` }] };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
+      }
+    }
+  );
+
+  // ─── 9. Delete Generation ────────────────────────────────────────────────────
+
+  server.registerTool(
+    "leonardo_delete_generation",
+    {
+      title: "Delete Generation",
+      description: `Delete a generation and all its images from your Leonardo account.
+  Use this for cleanup after testing or when you no longer need results.
+
+  Args:
+    - generation_id (string): The generationId to delete.
+
+  Returns: { deleted: true } on success.`,
+      inputSchema: z.object({
+        generation_id: uuidArg("generation_id").describe("The generationId to delete"),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ generation_id }) => {
+      try {
+        await leo("DELETE", `/generations/${idSegment(generation_id)}`);
+        return { content: [{ type: "text" as const, text: JSON.stringify({ deleted: true, id: generation_id }) }] };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }] };
+      }
+    }
+  );
+
+  return server;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTP auth
+// The HTTP transport spends the server's own Leonardo credits, so it must not be
+// open to the internet. Set MCP_ACCESS_KEY (a long random string; several keys
+// may be given comma-separated to rotate without downtime) and connect with
+// either form:
+//   - path token:   https://<host>/mcp/<MCP_ACCESS_KEY>   (for claude.ai URL connectors)
+//   - bearer token: POST /mcp with "Authorization: Bearer <MCP_ACCESS_KEY>"
+// Keys are compared in constant time (SHA-256 digests + timingSafeEqual).
+//
+// When MCP_ACCESS_KEY is unset the server stays reachable without a token (so an
+// auto-deploy from GitHub does not cut off the existing connector) and logs a
+// loud warning. Set MCP_REQUIRE_AUTH=true to refuse all /mcp requests instead.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MIN_KEY_LENGTH = 32;
+const ACCESS_KEYS = (process.env.MCP_ACCESS_KEY ?? "")
+  .split(",")
+  .map(k => k.trim())
+  .filter(k => k.length > 0);
+const ACCESS_KEY_DIGESTS = ACCESS_KEYS.map(k => createHash("sha256").update(k, "utf8").digest());
+const REQUIRE_AUTH = /^(1|true|yes|on)$/i.test((process.env.MCP_REQUIRE_AUTH ?? "").trim());
+
+type AuthMode = "enforced" | "open" | "locked";
+const AUTH_MODE: AuthMode = ACCESS_KEY_DIGESTS.length > 0 ? "enforced" : REQUIRE_AUTH ? "locked" : "open";
+
+/** Constant-time check of a candidate token against every configured key. */
+function tokenMatches(candidate: string | undefined): boolean {
+  if (!candidate || ACCESS_KEY_DIGESTS.length === 0) return false;
+  const digest = createHash("sha256").update(candidate, "utf8").digest();
+  let ok = false;
+  for (const key of ACCESS_KEY_DIGESTS) {
+    if (timingSafeEqual(digest, key)) ok = true; // no early exit
   }
-);
+  return ok;
+}
+
+function bearerToken(header: string | undefined): string | undefined {
+  if (!header) return undefined;
+  const m = /^Bearer[ \t]+(\S+)[ \t]*$/i.exec(header.trim());
+  return m ? m[1] : undefined;
+}
+
+function rpcError(code: number, message: string) {
+  return { jsonrpc: "2.0", error: { code, message }, id: null };
+}
+
+let lastOpenWarning = 0;
+function warnOpen(): void {
+  const now = Date.now();
+  if (now - lastOpenWarning < 10 * 60_000) return;
+  lastOpenWarning = now;
+  console.error(
+    "SECURITY WARNING: /mcp is UNAUTHENTICATED — anyone with the URL can spend this Leonardo account's credits. " +
+    "Set MCP_ACCESS_KEY (and point the connector at /mcp/<key>) to require a token."
+  );
+}
+
+function mcpAuth(req: Request, res: Response, next: NextFunction): void {
+  if (AUTH_MODE === "open") {
+    warnOpen();
+    next();
+    return;
+  }
+  if (AUTH_MODE === "locked") {
+    res.status(503).json(rpcError(-32001, "MCP endpoint disabled: MCP_REQUIRE_AUTH is set but MCP_ACCESS_KEY is not"));
+    return;
+  }
+  const pathToken = typeof req.params.token === "string" ? req.params.token : undefined;
+  const headerToken = bearerToken(req.get("authorization"));
+  const okPath = tokenMatches(pathToken);
+  const okHeader = tokenMatches(headerToken);
+  if (okPath || okHeader) {
+    next();
+    return;
+  }
+  res.status(401).json(rpcError(-32001, "Unauthorized"));
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Server Transports
@@ -690,32 +799,67 @@ Returns: { deleted: true } on success.`,
 
 async function runHTTP(): Promise<void> {
   const app = express();
-  app.use(express.json());
+  app.disable("x-powered-by");
+
+  if (AUTH_MODE === "enforced") {
+    console.error(`MCP auth: enforced (${ACCESS_KEYS.length} key${ACCESS_KEYS.length === 1 ? "" : "s"} configured)`);
+    if (ACCESS_KEYS.some(k => k.length < MIN_KEY_LENGTH)) {
+      console.error(`SECURITY WARNING: an MCP_ACCESS_KEY is shorter than ${MIN_KEY_LENGTH} characters; use a long random value (e.g. openssl rand -hex 32).`);
+    }
+  } else if (AUTH_MODE === "locked") {
+    console.error("MCP auth: MCP_REQUIRE_AUTH is set but MCP_ACCESS_KEY is empty — every /mcp request will be refused (503).");
+  } else {
+    warnOpen();
+  }
 
   app.get("/health", (_req, res) => {
-    res.json({ status: "ok", service: "leonardo-mcp-server", tools: 9 });
+    res.json({ status: "ok", service: "leonardo-mcp-server", tools: 9, auth: AUTH_MODE });
   });
 
-  app.post("/mcp", async (req, res) => {
+  const MCP_PATHS = ["/mcp", "/mcp/:token"];
+
+  // Auth runs before the body is parsed, so unauthenticated callers cannot make us parse large bodies.
+  app.post(MCP_PATHS, mcpAuth, express.json({ limit: "100kb" }), async (req: Request, res: Response) => {
+    const server = createServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
     });
-    res.on("close", () => transport.close());
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
+    res.on("close", () => {
+      void transport.close();
+      void server.close();
+    });
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+    } catch (err) {
+      console.error("MCP request failed:", (err as Error).message);
+      if (!res.headersSent) res.status(500).json(rpcError(-32603, "Internal server error"));
+    }
   });
 
-  const port = parseInt(process.env.PORT ?? "3000");
+  // Stateless server: no SSE stream (GET) and no sessions to delete (DELETE).
+  app.all(MCP_PATHS, (_req, res) => {
+    res.set("Allow", "POST").status(405).json(rpcError(-32000, "Method not allowed"));
+  });
+
+  // Malformed JSON and similar errors: answer without echoing the request path (it may hold the key).
+  app.use((err: Error & { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
+    const status = typeof err.status === "number" && err.status >= 400 && err.status < 600 ? err.status : 500;
+    if (status >= 500) console.error("HTTP error:", err.message);
+    if (!res.headersSent) res.status(status).json(rpcError(status === 413 ? -32600 : -32700, status === 413 ? "Request too large" : "Bad request"));
+  });
+
+  const port = parseInt(process.env.PORT ?? "3000", 10);
   app.listen(port, () => {
-    console.error(`Leonardo MCP server listening on http://localhost:${port}/mcp`);
+    console.error(`Leonardo MCP server listening on port ${port} (POST /mcp${AUTH_MODE === "enforced" ? "/<key> or Bearer" : ""})`);
     console.error(`Health: http://localhost:${port}/health`);
   });
 }
 
 async function runStdio(): Promise<void> {
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await createServer().connect(transport);
   console.error("Leonardo MCP server running on stdio");
 }
 
