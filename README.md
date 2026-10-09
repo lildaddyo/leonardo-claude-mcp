@@ -27,6 +27,13 @@ MCP server connecting Claude to **Leonardo AI** for image generation, img2img, a
 | `LEONARDO_API_KEY` | ✅ | Your Leonardo API key |
 | `TRANSPORT` | ✅ | `http` for Railway, `stdio` for local |
 | `PORT` | ✅ | `3000` |
+| `LEONARDO_MAX_JOBS_PER_DAY` | | Spend guard: max paid jobs (image, img2img, video, upscale) per UTC day. Default `200` |
+| `LEONARDO_MAX_ULTRA_PER_DAY` | | Spend guard: max Ultra image jobs per UTC day. Default `25` |
+| `LEONARDO_MAX_VIDEO_PER_DAY` | | Spend guard: max image-to-video jobs per UTC day. Default `25` |
+| `LEONARDO_MAX_JOBS_PER_MINUTE` | | Spend guard: burst rate limit for paid jobs. Default `15` |
+| `LEONARDO_MIN_CREDIT_BALANCE` | | Spend guard: refuse Ultra/video jobs when the API credit balance is below this. Default `0` (off) |
+
+The spend guard is in memory and per process: counters reset at 00:00 UTC and on restart.
 
 ---
 

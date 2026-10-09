@@ -56,6 +56,74 @@ function sleep(ms: number): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Spend guard (in-memory, per process)
+// Caps credit-consuming calls so a runaway agent loop or a leaked connector URL
+// cannot drain the whole Leonardo balance. Defaults are generous; tune via env.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function envInt(name: string, fallback: number): number {
+  const n = parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+const SPEND_LIMITS = {
+  jobsPerDay: envInt("LEONARDO_MAX_JOBS_PER_DAY", 200),        // all paid jobs
+  ultraPerDay: envInt("LEONARDO_MAX_ULTRA_PER_DAY", 25),       // ultra image jobs
+  videoPerDay: envInt("LEONARDO_MAX_VIDEO_PER_DAY", 25),       // image-to-video jobs
+  jobsPerMinute: envInt("LEONARDO_MAX_JOBS_PER_MINUTE", 15),   // burst rate limit
+  minCreditBalance: envInt("LEONARDO_MIN_CREDIT_BALANCE", 0),  // 0 = no balance check
+};
+
+type SpendKind = "image" | "ultra" | "video" | "upscale";
+
+const spendState = {
+  day: "",
+  jobs: 0,
+  ultra: 0,
+  video: 0,
+  recent: [] as number[], // timestamps of jobs in the last minute
+};
+
+/** Throws if this paid job would exceed a cap; otherwise records it. */
+async function reserveSpend(kind: SpendKind): Promise<void> {
+  const now = Date.now();
+  const today = new Date(now).toISOString().slice(0, 10);
+  if (spendState.day !== today) {
+    spendState.day = today;
+    spendState.jobs = 0;
+    spendState.ultra = 0;
+    spendState.video = 0;
+  }
+  spendState.recent = spendState.recent.filter(t => now - t < 60_000);
+
+  if (spendState.recent.length >= SPEND_LIMITS.jobsPerMinute) {
+    throw new Error(`Spend guard: rate limit of ${SPEND_LIMITS.jobsPerMinute} paid jobs per minute reached, try again shortly`);
+  }
+  if (spendState.jobs >= SPEND_LIMITS.jobsPerDay) {
+    throw new Error(`Spend guard: daily cap of ${SPEND_LIMITS.jobsPerDay} paid jobs reached (resets 00:00 UTC)`);
+  }
+  if (kind === "ultra" && spendState.ultra >= SPEND_LIMITS.ultraPerDay) {
+    throw new Error(`Spend guard: daily cap of ${SPEND_LIMITS.ultraPerDay} ultra jobs reached (resets 00:00 UTC)`);
+  }
+  if (kind === "video" && spendState.video >= SPEND_LIMITS.videoPerDay) {
+    throw new Error(`Spend guard: daily cap of ${SPEND_LIMITS.videoPerDay} video jobs reached (resets 00:00 UTC)`);
+  }
+
+  if (SPEND_LIMITS.minCreditBalance > 0 && (kind === "ultra" || kind === "video")) {
+    const me = await leo<{ user_details: Array<{ apiCreditBalance?: number }> }>("GET", "/me");
+    const balance = me.user_details?.[0]?.apiCreditBalance;
+    if (typeof balance === "number" && balance < SPEND_LIMITS.minCreditBalance) {
+      throw new Error(`Spend guard: API credit balance ${balance} is below the floor of ${SPEND_LIMITS.minCreditBalance}`);
+    }
+  }
+
+  spendState.jobs++;
+  if (kind === "ultra") spendState.ultra++;
+  if (kind === "video") spendState.video++;
+  spendState.recent.push(now);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -256,6 +324,7 @@ Style UUIDs (common):
       if (params.negative_prompt) body.negative_prompt = params.negative_prompt;
       if (params.style_uuid) body.styleUUID = params.style_uuid;
 
+      await reserveSpend(params.ultra ? "ultra" : "image");
       const res = await leo<{ sdGenerationJob: { generationId: string } }>(
         "POST", "/generations", body
       );
@@ -382,6 +451,7 @@ Returns same format as leonardo_generate_image.`,
       if (params.model_id) body.modelId = params.model_id;
       if (params.negative_prompt) body.negative_prompt = params.negative_prompt;
 
+      await reserveSpend("image");
       const res = await leo<{ sdGenerationJob: { generationId: string } }>(
         "POST", "/generations", body
       );
@@ -486,6 +556,7 @@ Note: Motion generations take 30-60 seconds and consume more API credits than im
   },
   async (params) => {
     try {
+      await reserveSpend("video");
       const res = await leo<{ motionSvdGenerationJob: { generationId: string } }>(
         "POST", "/generations/image-to-motion",
         {
@@ -540,6 +611,7 @@ Note: Upscaling takes 10-30 seconds. The result is returned directly (no polling
   },
   async ({ image_id }) => {
     try {
+      await reserveSpend("upscale");
       const res = await leo<{ createdVariation: { id: string } }>(
         "POST", `/variations/upscale`, { id: image_id }
       );
