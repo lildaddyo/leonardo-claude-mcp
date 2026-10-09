@@ -109,18 +109,37 @@ async function reserveSpend(kind: SpendKind): Promise<void> {
     throw new Error(`Spend guard: daily cap of ${SPEND_LIMITS.videoPerDay} video jobs reached (resets 00:00 UTC)`);
   }
 
-  if (SPEND_LIMITS.minCreditBalance > 0 && (kind === "ultra" || kind === "video")) {
-    const me = await leo<{ user_details: Array<{ apiCreditBalance?: number }> }>("GET", "/me");
-    const balance = me.user_details?.[0]?.apiCreditBalance;
-    if (typeof balance === "number" && balance < SPEND_LIMITS.minCreditBalance) {
-      throw new Error(`Spend guard: API credit balance ${balance} is below the floor of ${SPEND_LIMITS.minCreditBalance}`);
-    }
-  }
-
+  // Record the slot before any await so parallel calls cannot all slip past the caps.
   spendState.jobs++;
   if (kind === "ultra") spendState.ultra++;
   if (kind === "video") spendState.video++;
   spendState.recent.push(now);
+
+  if (SPEND_LIMITS.minCreditBalance > 0 && (kind === "ultra" || kind === "video")) {
+    let balance: number | undefined;
+    try {
+      const me = await leo<{ user_details: Array<{ apiCreditBalance?: number }> }>("GET", "/me");
+      balance = me.user_details?.[0]?.apiCreditBalance;
+    } catch (err) {
+      releaseSpend(kind, now, today);
+      throw err;
+    }
+    if (typeof balance === "number" && balance < SPEND_LIMITS.minCreditBalance) {
+      releaseSpend(kind, now, today);
+      throw new Error(`Spend guard: API credit balance ${balance} is below the floor of ${SPEND_LIMITS.minCreditBalance}`);
+    }
+  }
+}
+
+/** Gives back a slot reserved by reserveSpend when the job was refused before it was sent. */
+function releaseSpend(kind: SpendKind, at: number, day: string): void {
+  if (spendState.day === day) {
+    spendState.jobs = Math.max(0, spendState.jobs - 1);
+    if (kind === "ultra") spendState.ultra = Math.max(0, spendState.ultra - 1);
+    if (kind === "video") spendState.video = Math.max(0, spendState.video - 1);
+  }
+  const i = spendState.recent.indexOf(at);
+  if (i !== -1) spendState.recent.splice(i, 1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
